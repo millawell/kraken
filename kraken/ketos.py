@@ -1068,33 +1068,34 @@ def pagegen(ctx, font, encoding, font_size, font_weight, language, output, text)
         
         return tmpl.render(page=page)
 
-
-    for it, t in enumerate(text):
+    merged_text = ''
+    for t in text:
         with click.open_file(t, encoding=encoding) as fp:
             logger.info('Reading {}'.format(t))
-            text_ = fp.read()
+            merged_text += fp.read()
     
-        lg = linegen.PageGenerator(font, font_size, font_weight, language, encoding)
+    lg = linegen.PageGenerator(font, font_size, font_weight, language)
 
-        im, regions = lg.render(text_)
+    im, regions = lg.render(merged_text)
 
-        base_fn = "{0:08d}".format(it)
-        image_fp = Path(output) / (base_fn + '.png')
+    base_fn = "{0:08d}".format(0)
+    image_fp = Path(output) / (base_fn + '.png')
 
-        alto_str = serialize(
-            regions=regions,
-            image_name=image_fp.name,
-            image_size=im.size,
-            writing_mode="horizontal-lr",
-            base_dir=output
-        )
-        
-        alto_fp = Path(output) / (base_fn + '.xml')
+    alto_str = serialize(
+        regions=regions,
+        image_name=image_fp.name,
+        image_size=im.size,
+        writing_mode="horizontal-lr",
+        base_dir=output
+    )
+    
+    
+    alto_fp = Path(output) / (base_fn + '.xml')
 
-        with open(alto_fp, 'w') as fp:
-            fp.write(alto_str)
-        
-        im.save(image_fp)
+    with open(alto_fp, 'w') as fp:
+        fp.write(alto_str)
+    
+    im.save(image_fp)
 
 
 @cli.command('linegen')
