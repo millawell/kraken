@@ -19,22 +19,28 @@ kraken.binarization
 
 An adaptive binarization algorithm.
 """
-import warnings
 import logging
-import numpy as np
+import warnings
+from typing import TYPE_CHECKING
 
-from PIL import Image
-from kraken.lib.util import pil2array, array2pil, is_bitonal, get_im_str
-from scipy.ndimage import filters, interpolation, morphology, affine_transform
+import numpy as np
+from scipy.ndimage import (affine_transform, binary_dilation, gaussian_filter,
+                           percentile_filter)
+from scipy.ndimage import zoom as _zoom
 
 from kraken.lib.exceptions import KrakenInputException
+from kraken.lib.util import array2pil, get_im_str, is_bitonal, pil2array
+
+if TYPE_CHECKING:
+    from PIL import Image
+
 
 __all__ = ['nlbin']
 
 logger = logging.getLogger(__name__)
 
 
-def nlbin(im: Image.Image,
+def nlbin(im: 'Image.Image',
           threshold: float = 0.5,
           zoom: float = 0.5,
           escale: float = 1.0,
@@ -42,7 +48,7 @@ def nlbin(im: Image.Image,
           perc: int = 80,
           range: int = 20,
           low: int = 5,
-          high: int = 90) -> Image.Image:
+          high: int = 90) -> 'Image.Image':
     """
     Performs binarization using non-linear processing.
 
@@ -85,9 +91,9 @@ def nlbin(im: Image.Image,
     logger.debug('Interpolation and percentile filtering')
     with warnings.catch_warnings():
         warnings.simplefilter('ignore', UserWarning)
-        m = interpolation.zoom(image, zoom)
-        m = filters.percentile_filter(m, perc, size=(range, 2))
-        m = filters.percentile_filter(m, perc, size=(2, range))
+        m = _zoom(image, zoom)
+        m = percentile_filter(m, perc, size=(range, 2))
+        m = percentile_filter(m, perc, size=(2, range))
         mh, mw = m.shape
         oh, ow = image.shape
         scale = np.diag([mh * 1.0/oh, mw * 1.0/ow])
@@ -104,11 +110,11 @@ def nlbin(im: Image.Image,
     # significant variance; this makes the percentile
     # based low and high estimates more reliable
     logger.debug('Refine estimates')
-    v = est-filters.gaussian_filter(est, escale*20.0)
-    v = filters.gaussian_filter(v**2, escale*20.0)**0.5
+    v = est-gaussian_filter(est, escale*20.0)
+    v = gaussian_filter(v**2, escale*20.0)**0.5
     v = (v > 0.3*np.amax(v))
-    v = morphology.binary_dilation(v, structure=np.ones((int(escale * 50), 1)))
-    v = morphology.binary_dilation(v, structure=np.ones((1, int(escale * 50))))
+    v = binary_dilation(v, structure=np.ones((int(escale * 50), 1)))
+    v = binary_dilation(v, structure=np.ones((1, int(escale * 50))))
     est = est[v]
     lo = np.percentile(est.ravel(), low)
     hi = np.percentile(est.ravel(), high)

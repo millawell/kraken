@@ -1,26 +1,27 @@
 """
 VGSL plumbing
 """
-import re
 import json
-import torch
 import logging
-import pathlib
+import re
+from os import PathLike
+from typing import (Any, Callable, Dict, Iterable, Optional, Sequence,
+                    Union)
 
+import torch
+from google.protobuf.message import DecodeError
 from torch import nn
-from typing import Sequence, List, Tuple, Union, Optional, Iterable, Callable, Dict, Any
 
 from kraken.lib import layers
-from kraken.lib import clstm_pb2
-from kraken.lib import pyrnn_pb2
 from kraken.lib.codec import PytorchCodec
 from kraken.lib.exceptions import KrakenInvalidModelException
 
-from coremltools.models import MLModel
-from coremltools.models import datatypes
+root_logger = logging.getLogger()
+level = root_logger.getEffectiveLevel()
+root_logger.setLevel(logging.ERROR)
+from coremltools.models import MLModel, datatypes
 from coremltools.models.neural_network import NeuralNetworkBuilder
-
-from google.protobuf.message import DecodeError
+root_logger.setLevel(level)
 
 # all tensors are ordered NCHW, the "feature" dimension is C, so the output of
 # an LSTM will be put into C same as the filters of a CNN.
@@ -70,77 +71,83 @@ class TorchVGSLModel(object):
     respectively.
 
     Attributes:
-        input (tuple): Expected input tensor as a 4-tuple.
-        nn (torch.nn.Sequential): Stack of layers parsed from the spec.
-        criterion (torch.nn.Module): Fully parametrized loss function.
-        user_metadata (dict): dict with user defined metadata. Is flushed into
+        input: Expected input tensor as a 4-tuple.
+        nn: Stack of layers parsed from the spec.
+        criterion: Fully parametrized loss function.
+        user_metadata: dict with user defined metadata. Is flushed into
                              model file during saving/overwritten by loading
                              operations.
-        one_channel_mode (str): Field indicating the image type used during
+        one_channel_mode: Field indicating the image type used during
                                 training of one-channel images. Is '1' for
                                 models trained on binarized images, 'L' for
                                 grayscale, and None otherwise.
     """
+
     def __init__(self, spec: str) -> None:
         """
         Constructs a torch module from a (subset of) VSGL spec.
 
         Args:
-            spec (str): Model definition similar to tesseract as follows:
-                        ============ FUNCTIONAL OPS ============
-                        C(s|t|r|l|m)[{name}]<y>,<x>,<d>[,<y_stride>,<x_stride>]
-                          Convolves using a y,x window, with no shrinkage, SAME
-                          infill, d outputs, with s|t|r|l|m non-linear layer.
-                          (s|t|r|l|m) specifies the type of non-linearity:
-                          s = sigmoid
-                          t = tanh
-                          r = relu
-                          l = linear (i.e., None)
-                          m = softmax
-                        L(f|r|b)(x|y)[s][{name}]<n> LSTM cell with n outputs.
-                          f runs the LSTM forward only.
-                          r runs the LSTM reversed only.
-                          b runs the LSTM bidirectionally.
-                          x runs the LSTM in the x-dimension (on data with or without the
-                             y-dimension).
-                          y runs the LSTM in the y-dimension (data must have a y dimension).
-                          s (optional) summarizes the output in the requested dimension,
-                             outputting only the final step, collapsing the dimension to a
-                             single element.
-                          Examples:
-                          Lfx128 runs a forward-only LSTM in the x-dimension with 128
-                                 outputs, treating any y dimension independently.
-                          Lfys64 runs a forward-only LSTM in the y-dimension with 64 outputs
-                                 and collapses the y-dimension to 1 element.
-                        Do[{name}][<p>,<d>] Insert a dropout layer operating in
-                                            <d> dimensions with probability
-                                            <p>. Defaults to 1D with 0.5
-                                            probability.
-                        Gn[{name}]<n> A group normalization layer with n groups
-                        ============ PLUMBING OPS ============
-                        [...] Execute ... networks in series (layers).
-                        (...) Execute ... networks in parallel.
-                        I[{name}] Identity function to build residual connections in parallel layers.
-                        Mp[{name}]<y>,<x>[<y_stride>,<x_stride>] Maxpool the input, reducing the (y,x) rectangle to a
-                          single vector value.
-                        S[{name}]<d>(<a>x<b>)<e>,<f> Splits one dimension, moves one part to another
-                          dimension.
+            spec: Model definition similar to tesseract as follows:
+                  ============ FUNCTIONAL OPS ============
+                  C[T](s|t|r|l|rl|m)[{name}]<y>,<x>,<d>[,<y_stride>,<x_stride>][,<y_dilation>,<x_dilation>]
+                    Convolves using a y,x window, with no shrinkage, SAME
+                    infill, d outputs, with s|t|r|l|m non-linear layer,
+                    T for transposed convolution.
+                    (s|t|r|l|m) specifies the type of non-linearity:
+                    s = sigmoid
+                    t = tanh
+                    r = relu
+                    lr = leaky relu
+                    l = linear (i.e., None)
+                    m = softmax
+                  L(f|r|b)(x|y)[s][{name}]<n> LSTM cell with n outputs.
+                    f runs the LSTM forward only.
+                    r runs the LSTM reversed only.
+                    b runs the LSTM bidirectionally.
+                    x runs the LSTM in the x-dimension (on data with or without the
+                       y-dimension).
+                    y runs the LSTM in the y-dimension (data must have a y dimension).
+                    s (optional) summarizes the output in the requested dimension,
+                       outputting only the final step, collapsing the dimension to a
+                       single element.
+                    Examples:
+                    Lfx128 runs a forward-only LSTM in the x-dimension with 128
+                           outputs, treating any y dimension independently.
+                    Lfys64 runs a forward-only LSTM in the y-dimension with 64 outputs
+                           and collapses the y-dimension to 1 element.
+                  Do[{name}][<p>,<d>] Insert a dropout layer operating in
+                                      <d> dimensions with probability
+                                      <p>. Defaults to 1D with 0.5
+                                      probability.
+                  Gn[{name}]<n> A group normalization layer with n groups
+                  ============ PLUMBING OPS ============
+                  [...] Execute ... networks in series (layers).
+                  (...) Execute ... networks in parallel.
+                  I[{name}] Identity function to build residual connections in parallel layers.
+                  Mp[{name}]<y>,<x>[<y_stride>,<x_stride>] Maxpool the input, reducing the (y,x) rectangle to a
+                    single vector value.
+                  S[{name}]<d>(<a>x<b>)<e>,<f> Splits one dimension, moves one part to another
+                    dimension.
         """
         self.spec = spec
-        self.named_spec = []  # type:  List[str]
+        self.named_spec: list[str] = []
         self.ops = [self.build_addition, self.build_identity, self.build_rnn,
                     self.build_dropout, self.build_maxpool, self.build_conv,
-                    self.build_output, self.build_reshape,
+                    self.build_output, self.build_reshape, self.build_wav2vec2,
                     self.build_groupnorm, self.build_series,
-                    self.build_parallel]
-        self.codec = None  # type: Optional[PytorchCodec]
-        self.criterion = None  # type: Any
+                    self.build_parallel, self.build_ro]
+        self.codec: Optional[PytorchCodec] = None
+        self.criterion: Any = None
         self.nn = layers.MultiParamSequential()
-        self.user_metadata = {'accuracy': [],
-                              'seg_type': None,
-                              'one_channel_mode': None,
-                              'model_type': None,
-                              'hyper_params': {}}  # type: dict[str, str]
+        self.user_metadata: Dict[str, Any] = {'accuracy': [],
+                                              'metrics': [],
+                                              'seg_type': None,
+                                              'one_channel_mode': None,
+                                              'model_type': None,
+                                              'hyper_params': {},
+                                              'legacy_polygons': False}  # enable new polygons by default on new models
+        self._aux_layers = nn.ModuleDict()
 
         self.idx = -1
         spec = spec.strip()
@@ -159,7 +166,10 @@ class TorchVGSLModel(object):
         self.named_spec.extend(str(x) for x in named_spec)
         self.init_weights()
 
-    def _parse(self, input: Tuple[int, int, int, int], blocks: Sequence[str], parallel=False) -> None:
+    def _parse(self,
+               input: tuple[int, int, int, int],
+               blocks: Sequence[str], parallel=False,
+               target_output_shape: Optional[tuple[int, int, int, int]] = None) -> None:
         """
         Parses VGSL spec and appends layers to nn
         """
@@ -176,7 +186,7 @@ class TorchVGSLModel(object):
             oshape = None
             layer = None
             for op in self.ops:
-                oshape, name, layer = op(input, blocks, idx)
+                oshape, name, layer = op(input, blocks, idx, target_output_shape=target_output_shape if parallel or idx == len(blocks) - 1 else None)
                 if oshape:
                     break
             if oshape:
@@ -187,6 +197,7 @@ class TorchVGSLModel(object):
                         raise ValueError('Output shape in parallel block not equal!')
                     else:
                         prev_oshape = oshape
+                        target_output_shape = oshape
                         channels += oshape[1]
                 named_spec.extend(name)  # type: ignore
                 idx += len(name)
@@ -210,10 +221,10 @@ class TorchVGSLModel(object):
             spec (str): VGSL spec without input block to append to model.
         """
         self.nn = self.nn[:idx]
-        self.idx = idx-1
+        self.idx = idx - 1
         spec = spec[1:-1]
         blocks = spec.split(' ')
-        self.named_spec = self.named_spec[:idx+1]
+        self.named_spec = self.named_spec[:idx + 1]
         named_spec, nn, self.output = self._parse(self.nn[-1].output_shape, blocks)
         self.named_spec.extend(str(x) for x in named_spec)
         for module in nn.named_children():
@@ -253,143 +264,7 @@ class TorchVGSLModel(object):
         torch.set_num_threads(num)
 
     @classmethod
-    def load_pronn_model(cls, path: Union[str, pathlib.Path]):
-        """
-        Loads an pronn model to VGSL.
-        """
-        with open(path, 'rb') as fp:
-            net = pyrnn_pb2.pyrnn()
-            try:
-                net.ParseFromString(fp.read())
-            except Exception:
-                raise KrakenInvalidModelException('File does not contain valid proto msg')
-            if not net.IsInitialized():
-                raise KrakenInvalidModelException('Model incomplete')
-
-        # extract codec
-        codec = PytorchCodec(net.codec)
-
-        input = net.ninput
-        hidden = net.fwdnet.wgi.dim[0]
-
-        # extract weights
-        weightnames = ('wgi', 'wgf', 'wci', 'wgo', 'wip', 'wfp', 'wop')
-
-        fwd_w = []
-        rev_w = []
-        for w in weightnames:
-            fwd_ar = getattr(net.fwdnet, w)
-            rev_ar = getattr(net.revnet, w)
-            fwd_w.append(torch.Tensor(fwd_ar.value).view(list(fwd_ar.dim)))
-            rev_w.append(torch.Tensor(rev_ar.value).view(list(rev_ar.dim)))
-
-        t = torch.cat(fwd_w[:4])
-        weight_ih_l0 = t[:, :input+1]
-        weight_hh_l0 = t[:, input+1:]
-
-        t = torch.cat(rev_w[:4])
-        weight_ih_l0_rev = t[:, :input+1]
-        weight_hh_l0_rev = t[:, input+1:]
-
-        weight_lin = torch.Tensor(net.softmax.w2.value).view(list(net.softmax.w2.dim))
-
-        # build vgsl spec and set weights
-        nn = cls('[1,1,0,{} Lbxo{} O1ca{}]'.format(input, hidden, len(net.codec)))
-
-        nn.nn.L_0.layer.weight_ih_l0 = torch.nn.Parameter(weight_ih_l0)
-        nn.nn.L_0.layer.weight_hh_l0 = torch.nn.Parameter(weight_hh_l0)
-        nn.nn.L_0.layer.weight_ih_l0_reverse = torch.nn.Parameter(weight_ih_l0_rev)
-        nn.nn.L_0.layer.weight_hh_l0_reverse = torch.nn.Parameter(weight_hh_l0_rev)
-        nn.nn.L_0.layer.weight_ip_l0 = torch.nn.Parameter(fwd_w[4])
-        nn.nn.L_0.layer.weight_fp_l0 = torch.nn.Parameter(fwd_w[5])
-        nn.nn.L_0.layer.weight_op_l0 = torch.nn.Parameter(fwd_w[6])
-        nn.nn.L_0.layer.weight_ip_l0_reverse = torch.nn.Parameter(rev_w[4])
-        nn.nn.L_0.layer.weight_fp_l0_reverse = torch.nn.Parameter(rev_w[5])
-        nn.nn.L_0.layer.weight_op_l0_reverse = torch.nn.Parameter(rev_w[6])
-
-        nn.nn.O_1.lin.weight = torch.nn.Parameter(weight_lin)
-
-        nn.add_codec(codec)
-
-        return nn
-
-    @classmethod
-    def load_clstm_model(cls, path: Union[str, pathlib.Path]):
-        """
-        Loads an CLSTM model to VGSL.
-        """
-        net = clstm_pb2.NetworkProto()
-        with open(path, 'rb') as fp:
-            try:
-                net.ParseFromString(fp.read())
-            except Exception:
-                raise KrakenInvalidModelException('File does not contain valid proto msg')
-            if not net.IsInitialized():
-                raise KrakenInvalidModelException('Model incomplete')
-
-        input = net.ninput
-        attrib = {a.key: a.value for a in list(net.attribute)}
-        # mainline clstm model
-        if len(attrib) > 1:
-            mode = 'clstm'
-        else:
-            mode = 'clstm_compat'
-
-        # extract codec
-        codec = PytorchCodec([''] + [chr(x) for x in net.codec[1:]])
-
-        # separate layers
-        nets = {}
-        nets['softm'] = [n for n in list(net.sub) if n.kind == 'SoftmaxLayer'][0]
-        parallel = [n for n in list(net.sub) if n.kind == 'Parallel'][0]
-        nets['lstm1'] = [n for n in list(parallel.sub) if n.kind.startswith('NPLSTM')][0]
-        rev = [n for n in list(parallel.sub) if n.kind == 'Reversed'][0]
-        nets['lstm2'] = rev.sub[0]
-
-        hidden = int(nets['lstm1'].attribute[0].value)
-
-        weights = {}  # type: Dict[str, torch.Tensor]
-        for n in nets:
-            weights[n] = {}
-            for w in list(nets[n].weights):
-                weights[n][w.name] = torch.Tensor(w.value).view(list(w.dim))
-
-        if mode == 'clstm_compat':
-            weightnames = ('.WGI', '.WGF', '.WCI', '.WGO')
-            weightname_softm = '.W'
-        else:
-            weightnames = ('WGI', 'WGF', 'WCI', 'WGO')
-            weightname_softm = 'W1'
-
-        # input hidden and hidden-hidden weights are in one matrix. also
-        # CLSTM/ocropy likes 1-augmenting every other tensor so the ih weights
-        # are input+1 in one dimension.
-        t = torch.cat(list(w for w in [weights['lstm1'][wn] for wn in weightnames]))
-        weight_ih_l0 = t[:, :input+1]
-        weight_hh_l0 = t[:, input+1:]
-
-        t = torch.cat(list(w for w in [weights['lstm2'][wn] for wn in weightnames]))
-        weight_ih_l0_rev = t[:, :input+1]
-        weight_hh_l0_rev = t[:, input+1:]
-
-        weight_lin = weights['softm'][weightname_softm]
-        if mode == 'clstm_compat':
-            weight_lin = torch.cat([torch.zeros(len(weight_lin), 1), weight_lin], 1)
-
-        # build vgsl spec and set weights
-        nn = cls('[1,1,0,{} Lbxc{} O1ca{}]'.format(input, hidden, len(net.codec)))
-        nn.nn.L_0.layer.weight_ih_l0 = torch.nn.Parameter(weight_ih_l0)
-        nn.nn.L_0.layer.weight_hh_l0 = torch.nn.Parameter(weight_hh_l0)
-        nn.nn.L_0.layer.weight_ih_l0_reverse = torch.nn.Parameter(weight_ih_l0_rev)
-        nn.nn.L_0.layer.weight_hh_l0_reverse = torch.nn.Parameter(weight_hh_l0_rev)
-        nn.nn.O_1.lin.weight = torch.nn.Parameter(weight_lin)
-
-        nn.add_codec(codec)
-
-        return nn
-
-    @classmethod
-    def load_model(cls, path: Union[str, pathlib.Path]):
+    def load_model(cls, path: Union[str, PathLike]):
         """
         Deserializes a VGSL model from a CoreML file.
 
@@ -404,14 +279,14 @@ class TorchVGSLModel(object):
             string, protobuf file, or without appropriate metadata).
             FileNotFoundError if the path doesn't point to a file.
         """
-        if isinstance(path, pathlib.Path):
+        if isinstance(path, PathLike):
             path = path.as_posix()
         try:
             mlmodel = MLModel(path)
         except TypeError as e:
-            raise KrakenInvalidModelException(str(e))
+            raise KrakenInvalidModelException(str(e)) from e
         except DecodeError as e:
-            raise KrakenInvalidModelException('Failure parsing model protobuf: {}'.format(str(e)))
+            raise KrakenInvalidModelException('Failure parsing model protobuf: {}'.format(str(e))) from e
         if 'vgsl' not in mlmodel.user_defined_metadata:
             raise KrakenInvalidModelException('No VGSL spec in model metadata')
         vgsl_spec = mlmodel.user_defined_metadata['vgsl']
@@ -425,16 +300,26 @@ class TorchVGSLModel(object):
             else:
                 layer.deserialize(name, mlmodel.get_spec())
 
-        _deserialize_layers('', nn.nn)
+        try:
+            _deserialize_layers('', nn.nn)
+        except Exception as exc:
+            raise KrakenInvalidModelException('Failed parsing out layers from model weights') from exc
+
+        if 'aux_layers' in mlmodel.user_defined_metadata:
+            logger.info('Deserializing auxiliary layers.')
+            nn.aux_layers = {k: cls(v).nn.get_submodule(k) for k, v in json.loads(mlmodel.user_defined_metadata['aux_layers']).items()}
 
         if 'codec' in mlmodel.user_defined_metadata:
             nn.add_codec(PytorchCodec(json.loads(mlmodel.user_defined_metadata['codec'])))
 
-        nn.user_metadata = {'accuracy': [],
-                            'seg_type': 'bbox',
-                            'one_channel_mode': '1',
-                            'model_type': None,
-                            'hyper_params': {}}  # type: dict[str, str]
+        nn.user_metadata: Dict[str, Any] = {'accuracy': [],
+                                            'metrics': [],
+                                            'seg_type': 'bbox',
+                                            'one_channel_mode': '1',
+                                            'model_type': None,
+                                            'hyper_params': {},
+                                            'legacy_polygons': True}  # disable new polygons by default on load
+
         if 'kraken_meta' in mlmodel.user_defined_metadata:
             nn.user_metadata.update(json.loads(mlmodel.user_defined_metadata['kraken_meta']))
         return nn
@@ -477,12 +362,28 @@ class TorchVGSLModel(object):
     def hyper_params(self, val: Dict[str, Any]):
         self.user_metadata['hyper_params'].update(val)
 
+    @property
+    def aux_layers(self, **kwargs):
+        return self._aux_layers
+
+    @aux_layers.setter
+    def aux_layers(self, val: Dict[str, torch.nn.Module]):
+        self._aux_layers.update(val)
+
+    @property
+    def use_legacy_polygons(self):
+        return self.user_metadata.get('legacy_polygons', True)
+
+    @use_legacy_polygons.setter
+    def use_legacy_polygons(self, val: bool):
+        self.user_metadata['legacy_polygons'] = val
+
     def save_model(self, path: str):
         """
         Serializes the model into path.
 
         Args:
-            path (str): Target destination
+            path: Target destination
         """
         inputs = [('input', datatypes.Array(*self.input))]
         outputs = [('output', datatypes.Array(*self.output))]
@@ -500,6 +401,15 @@ class TorchVGSLModel(object):
                     else:
                         l.serialize(name, input, net_builder)
             _serialize_layer(self.nn, input, net_builder)
+            if self.aux_layers:
+                prev_aux_device = next(self.aux_layers.parameters()).device
+                try:
+                    logger.debug(f'Serializing {len(self.aux_layers)} auxiliary layers')
+                    self.aux_layers.to('cpu')
+                    _serialize_layer(self.aux_layers, input, net_builder)
+                finally:
+                    self.aux_layers.to(prev_aux_device)
+
             mlmodel = MLModel(net_builder.spec)
             mlmodel.short_description = 'kraken model'
             mlmodel.user_defined_metadata['vgsl'] = '[' + ' '.join(self.named_spec) + ']'
@@ -507,6 +417,8 @@ class TorchVGSLModel(object):
                 mlmodel.user_defined_metadata['codec'] = json.dumps(self.codec.c2l)
             if self.user_metadata:
                 mlmodel.user_defined_metadata['kraken_meta'] = json.dumps(self.user_metadata)
+            if self.aux_layers:
+                mlmodel.user_defined_metadata['aux_layers'] = json.dumps({k: v.get_spec(k) for k, v in self.aux_layers.items()})
             mlmodel.save(path)
         finally:
             self.nn.to(prev_device)
@@ -539,11 +451,11 @@ class TorchVGSLModel(object):
                         torch.nn.init.orthogonal_(p.data)
                     # initialize biases to 1 (jozefowicz 2015)
                     else:
-                        torch.nn.init.constant_(p.data[len(p)//4:len(p)//2], 1.0)
+                        torch.nn.init.constant_(p.data[len(p) // 4:len(p) // 2], 1.0)
             elif isinstance(m, torch.nn.GRU):
                 for p in m.parameters():
                     torch.nn.init.orthogonal_(p.data)
-            elif isinstance(m, torch.nn.Conv2d):
+            elif isinstance(m, torch.nn.Conv2d) or isinstance(m, torch.nn.ConvTranspose2d):
                 for p in m.parameters():
                     torch.nn.init.uniform_(p.data, -0.1, 0.1)
         self.nn[idx].apply(_wi)
@@ -569,9 +481,11 @@ class TorchVGSLModel(object):
         self.spec = '[' + ' '.join(self.named_spec) + ']'
 
     def build_rnn(self,
-                  input: Tuple[int, int, int, int],
-                  blocks: List[str],
-                  idx: int) -> Union[Tuple[None, None, None], Tuple[Tuple[int, int, int, int], str, Callable]]:
+                  input: tuple[int, int, int, int],
+                  blocks: list[str],
+                  idx: int,
+                  target_output_shape: Optional[tuple[int, int, int, int]] = None) -> Union[tuple[None, None, None],
+                                                                                            tuple[tuple[int, int, int, int], str, Callable]]:
         """
         Builds an LSTM/GRU layer returning number of outputs and layer.
         """
@@ -596,9 +510,11 @@ class TorchVGSLModel(object):
         return fn.get_shape(input), [VGSLBlock(blocks[idx], type, m.group('name'), self.idx)], fn
 
     def build_dropout(self,
-                      input: Tuple[int, int, int, int],
-                      blocks: List[str],
-                      idx: int) -> Union[Tuple[None, None, None], Tuple[Tuple[int, int, int, int], str, Callable]]:
+                      input: tuple[int, int, int, int],
+                      blocks: list[str],
+                      idx: int,
+                      target_output_shape: Optional[tuple[int, int, int, int]] = None) -> Union[tuple[None, None, None],
+                                                                                                tuple[tuple[int, int, int, int], str, Callable]]:
         pattern = re.compile(r'(?P<type>Do)(?P<name>{\w+})?(?P<p>(\d+(\.\d*)?|\.\d+))?(,(?P<dim>\d+))?')
         m = pattern.match(blocks[idx])
         if not m:
@@ -611,9 +527,11 @@ class TorchVGSLModel(object):
         return fn.get_shape(input), [VGSLBlock(blocks[idx], m.group('type'), m.group('name'), self.idx)], fn
 
     def build_addition(self,
-                       input: Tuple[int, int, int, int],
-                       blocks: List[str],
-                       idx: int) -> Union[Tuple[None, None, None], Tuple[Tuple[int, int, int, int], str, Callable]]:
+                       input: tuple[int, int, int, int],
+                       blocks: list[str],
+                       idx: int,
+                       target_output_shape: Optional[tuple[int, int, int, int]] = None) -> Union[tuple[None, None, None],
+                                                                                                 tuple[tuple[int, int, int, int], str, Callable]]:
         pattern = re.compile(r'(?P<type>A)(?P<name>{\w+})?(?P<dim>\d+),(?P<chunk_size>\d+)')
         m = pattern.match(blocks[idx])
         if not m:
@@ -630,9 +548,11 @@ class TorchVGSLModel(object):
         return fn.get_shape(input), [VGSLBlock(blocks[idx], m.group('type'), m.group('name'), self.idx)], fn
 
     def build_identity(self,
-                       input: Tuple[int, int, int, int],
-                       blocks: List[str],
-                       idx: int) -> Union[Tuple[None, None, None], Tuple[Tuple[int, int, int, int], str, Callable]]:
+                       input: tuple[int, int, int, int],
+                       blocks: list[str],
+                       idx: int,
+                       target_output_shape: Optional[tuple[int, int, int, int]] = None) -> Union[tuple[None, None, None],
+                                                                                                 tuple[tuple[int, int, int, int], str, Callable]]:
         pattern = re.compile(r'(?P<type>I)(?P<name>{\w+})?')
         m = pattern.match(blocks[idx])
         if not m:
@@ -643,9 +563,11 @@ class TorchVGSLModel(object):
         return fn.get_shape(input), [VGSLBlock(blocks[idx], m.group('type'), m.group('name'), self.idx)], fn
 
     def build_groupnorm(self,
-                        input: Tuple[int, int, int, int],
-                        blocks: List[str],
-                        idx: int) -> Union[Tuple[None, None, None], Tuple[Tuple[int, int, int, int], str, Callable]]:
+                        input: tuple[int, int, int, int],
+                        blocks: list[str],
+                        idx: int,
+                        target_output_shape: Optional[tuple[int, int, int, int]] = None) -> Union[tuple[None, None, None],
+                                                                                                  tuple[tuple[int, int, int, int], str, Callable]]:
         pattern = re.compile(r'(?P<type>Gn)(?P<name>{\w+})?(?P<groups>\d+)')
         m = pattern.match(blocks[idx])
         if not m:
@@ -656,32 +578,83 @@ class TorchVGSLModel(object):
         logger.debug('{}\t\tgroupnorm\tgroups {}'.format(self.idx, groups))
         return fn.get_shape(input), [VGSLBlock(blocks[idx], m.group('type'), m.group('name'), self.idx)], fn
 
-    def build_conv(self,
-                   input: Tuple[int, int, int, int],
-                   blocks: List[str],
-                   idx: int) -> Union[Tuple[None, None, None], Tuple[Tuple[int, int, int, int], str, Callable]]:
+    def build_wav2vec2(self,
+                       input: tuple[int, int, int, int],
+                       blocks: list[str],
+                       idx: int,
+                       target_output_shape: Optional[tuple[int, int, int, int]] = None) -> Union[tuple[None, None, None],
+                                                                                                 tuple[tuple[int, int, int, int], str, Callable]]:
         """
-        Builds a 2D convolution layer.
+        Builds a Wav2Vec2 masking layer.
         """
-        pattern = re.compile(r'(?P<type>C)(?P<nl>s|t|r|l|m)(?P<name>{\w+})?(\d+),'
-                             r'(\d+),(?P<out>\d+)(,(?P<stride_y>\d+),(?P<stride_x>\d+))?')
+        pattern = re.compile(r'(?P<type>W)(?P<name>{\w+})(?P<final_dim>\d+),(?P<mask_width>\d+),(?P<mask_prob>(\d+(\.\d*)?|\.\d+)),(?P<num_negatives>\d+)')
         m = pattern.match(blocks[idx])
         if not m:
             return None, None, None
-        kernel_size = (int(m.group(4)), int(m.group(5)))
-        filters = int(m.group('out'))
-        stride = (int(m.group('stride_y')), int(m.group('stride_x'))) if m.group('stride_x') else (1, 1)
-        nl = m.group('nl')
-        fn = layers.ActConv2D(input[1], filters, kernel_size, stride, nl)
+        final_dim = int(m.group('final_dim'))
+        mask_width = int(m.group('mask_width'))
+        mask_prob = float(m.group('mask_prob'))
+        num_negatives = int(m.group('num_negatives'))
+        from kraken.lib import pretrain
+        fn = pretrain.layers.Wav2Vec2Mask(input[1], final_dim, mask_width, mask_prob, num_negatives)
         self.idx += 1
-        logger.debug(f'{self.idx}\t\tconv\tkernel {kernel_size[0]} x {kernel_size[1]} '
-                     f'filters {filters} stride {stride} activation {nl}')
+        logger.debug(f'{self.idx}\t\twav2vec2\tmask width {mask_width}, prob '
+                     f'{mask_prob}, negative samples {num_negatives}')
         return fn.get_shape(input), [VGSLBlock(blocks[idx], m.group('type'), m.group('name'), self.idx)], fn
 
+    def build_ro(self,
+                 input: tuple[int, int, int, int],
+                 blocks: list[str],
+                 idx: int,
+                 target_output_shape: Optional[tuple[int, int, int, int]] = None) -> Union[tuple[None, None, None],
+                                                                                           tuple[tuple[int, int, int, int], str, Callable]]:
+        """
+        Builds a RO determination layer.
+        """
+        pattern = re.compile(r'(?P<type>RO)(?P<name>{\w+})(?P<feature_size>\d+),(?P<hidden_size>\d+)')
+        m = pattern.match(blocks[idx])
+        if not m:
+            return None, None, None
+        feature_size = int(m.group('feature_size'))
+        hidden_size = int(m.group('hidden_size'))
+        from kraken.lib import ro
+        fn = ro.layers.MLP(feature_size, hidden_size)
+        self.idx += 1
+        logger.debug(f'{self.idx}\t\tro\tfeatures {feature_size}, hidden_size {hidden_size}')
+        return fn.get_shape(input), [VGSLBlock(blocks[idx], m.group('type'), m.group('name'), self.idx)], fn
+
+    def build_conv(self,
+                   input: tuple[int, int, int, int],
+                   blocks: list[str],
+                   idx: int,
+                   target_output_shape: Optional[tuple[int, int, int, int]] = None) -> Union[tuple[None, None, None],
+                                                                                             tuple[tuple[int, int, int, int], str, Callable]]:
+        """
+        Builds a 2D convolution layer.
+        """
+        pattern = re.compile(r'(?P<type>C)(?P<trans>T)?(?P<nl>s|t|r|l|lr|m)(?P<name>{\w+})?(\d+),'
+                             r'(\d+),(?P<out>\d+)(,(?P<stride_y>\d+),(?P<stride_x>\d+))?(,(?P<dilation_y>\d+),(?P<dilation_x>\d+))?')
+        m = pattern.match(blocks[idx])
+        if not m:
+            return None, None, None
+        transposed = m.group('trans') is not None
+        kernel_size = (int(m.group(5)), int(m.group(6)))
+        filters = int(m.group('out'))
+        stride = (int(m.group('stride_y')), int(m.group('stride_x'))) if m.group('stride_x') else (1, 1)
+        dilation = (int(m.group('dilation_y')), int(m.group('dilation_x'))) if m.group('dilation_x') else (1, 1)
+        nl = m.group('nl')
+        fn = layers.ActConv2D(input[1], filters, kernel_size, stride, nl, dilation, transposed)
+        self.idx += 1
+        logger.debug(f'{self.idx}\t\t{"transposed " if transposed else ""}conv\tkernel {kernel_size[0]} x {kernel_size[1]} '
+                     f'filters {filters} stride {stride} dilation {dilation} activation {nl}')
+        return fn.get_shape(input, target_output_shape), [VGSLBlock(blocks[idx], m.group('type'), m.group('name'), self.idx)], fn
+
     def build_maxpool(self,
-                      input: Tuple[int, int, int, int],
-                      blocks: List[str],
-                      idx: int) -> Union[Tuple[None, None, None], Tuple[Tuple[int, int, int, int], str, Callable]]:
+                      input: tuple[int, int, int, int],
+                      blocks: list[str],
+                      idx: int,
+                      target_output_shape: Optional[tuple[int, int, int, int]] = None) -> Union[tuple[None, None, None],
+                                                                                                tuple[tuple[int, int, int, int], str, Callable]]:
         """
         Builds a maxpool layer.
         """
@@ -698,9 +671,11 @@ class TorchVGSLModel(object):
         return fn.get_shape(input), [VGSLBlock(blocks[idx], m.group('type'), m.group('name'), self.idx)], fn
 
     def build_reshape(self,
-                      input: Tuple[int, int, int, int],
-                      blocks: List[str],
-                      idx: int) -> Union[Tuple[None, None, None], Tuple[Tuple[int, int, int, int], str, Callable]]:
+                      input: tuple[int, int, int, int],
+                      blocks: list[str],
+                      idx: int,
+                      target_output_shape: Optional[tuple[int, int, int, int]] = None) -> Union[tuple[None, None, None],
+                                                                                                tuple[tuple[int, int, int, int], str, Callable]]:
         """
         Builds a reshape layer
         """
@@ -736,9 +711,11 @@ class TorchVGSLModel(object):
         return fn.get_shape(input), [VGSLBlock(blocks[idx], m.group('type'), m.group('name'), self.idx)], fn
 
     def build_output(self,
-                     input: Tuple[int, int, int, int],
-                     blocks: List[str],
-                     idx: int) -> Union[Tuple[None, None, None], Tuple[Tuple[int, int, int, int], str, Callable]]:
+                     input: tuple[int, int, int, int],
+                     blocks: list[str],
+                     idx: int,
+                     target_output_shape: Optional[tuple[int, int, int, int]] = None) -> Union[tuple[None, None, None],
+                                                                                               tuple[tuple[int, int, int, int], str, Callable]]:
         """
         Builds an output layer.
         """
@@ -754,7 +731,7 @@ class TorchVGSLModel(object):
         if nl == 'c' and dim == 2:
             raise ValueError('CTC not supported for heatmap output')
         if nl in ['l', 's'] and int(m.group('out')) >= 1:
-            self.criterion = nn.BCELoss()
+            self.criterion = nn.BCEWithLogitsLoss()
         elif nl == 'c':
             self.criterion = nn.CTCLoss(reduction='sum', zero_infinity=True)
         else:
@@ -773,10 +750,40 @@ class TorchVGSLModel(object):
             logger.debug('{}\t\tlinear\taugmented {} out {}'.format(self.idx, aug, m.group('out')))
             return lin.get_shape(input), [VGSLBlock(blocks[idx], m.group(1), m.group('name'), self.idx)], lin
 
+    def _bracket_count(self, block: str) -> int:
+        rst = 0
+        for c in block:
+            if c == "[":
+                rst += 1
+            elif c != "(":
+                break
+        for c in block[::-1]:
+            if c == "]":
+                rst -= 1
+            elif c != ")":
+                break
+        return rst
+
+    def _parenthesis_count(self, block: str) -> int:
+        rst = 0
+        for c in block:
+            if c == "(":
+                rst += 1
+            elif c != "[":
+                break
+        for c in block[::-1]:
+            if c == ")":
+                rst -= 1
+            elif c != "]":
+                break
+        return rst
+
     def build_series(self,
-                     input: Tuple[int, int, int, int],
-                     blocks: List[str],
-                     idx: int) -> Union[Tuple[None, None, None], Tuple[Tuple[int, int, int, int], str, Callable]]:
+                     input: tuple[int, int, int, int],
+                     blocks: list[str],
+                     idx: int,
+                     target_output_shape: Optional[tuple[int, int, int, int]] = None) -> Union[tuple[None, None, None],
+                                                                                               tuple[tuple[int, int, int, int], str, Callable]]:
         """
         Builds a serial block of layers.
         """
@@ -790,23 +797,23 @@ class TorchVGSLModel(object):
         # multiple layers in serial block
         block_depth = 0
         for bl_idx, block in enumerate(blocks[idx:]):
-            if block[0] == '[':
-                block_depth += 1
-            if block[-1] == ']':
-                block_depth -= 1
-                if block_depth == 0:
-                    break
+            block_depth += self._bracket_count(block)
+            if block_depth == 0:
+                break
         if block_depth:
-            raise ValueError('Unbalanced parantheses in VGSL spec')
-        named_spec, nn, oshape = self._parse(input, [blocks[idx][1:]] + blocks[idx+1:idx+bl_idx] + [blocks[idx+bl_idx][:-1]])
+            raise ValueError('Unbalanced parentheses in VGSL spec')
+        named_spec, nn, oshape = self._parse(input, [blocks[idx][1:]] + blocks[idx + 1:idx + bl_idx] +
+                                             [blocks[idx + bl_idx][:-1]], target_output_shape=target_output_shape)
         named_spec[0]._block = '[' + named_spec[0]._block
         named_spec[-1]._block = named_spec[-1]._block + ']'
         return oshape, named_spec, nn
 
     def build_parallel(self,
-                       input: Tuple[int, int, int, int],
-                       blocks: List[str],
-                       idx: int) -> Union[Tuple[None, None, None], Tuple[Tuple[int, int, int, int], str, Callable]]:
+                       input: tuple[int, int, int, int],
+                       blocks: list[str],
+                       idx: int,
+                       target_output_shape: Optional[tuple[int, int, int, int]] = None) -> Union[tuple[None, None, None],
+                                                                                                 tuple[tuple[int, int, int, int], str, Callable]]:
         """
         Builds a block of parallel layers.
         """
@@ -819,15 +826,13 @@ class TorchVGSLModel(object):
             return oshape, named_spec, nn
         block_depth = 0
         for bl_idx, block in enumerate(blocks[idx:]):
-            if block[0] == '(':
-                block_depth += 1
-            if block[-1] == ')':
-                block_depth -= 1
-                if block_depth == 0:
-                    break
+            block_depth += self._parenthesis_count(block)
+            if block_depth == 0:
+                break
         if block_depth:
-            raise ValueError('Unbalanced parantheses in VGSL spec')
-        named_spec, nn, oshape = self._parse(input, [blocks[idx][1:]] + blocks[idx+1:idx+bl_idx] + [blocks[idx+bl_idx][:-1]], parallel=True)
+            raise ValueError('Unbalanced parentheses in VGSL spec')
+        named_spec, nn, oshape = self._parse(input, [blocks[idx][1:]] + blocks[idx + 1:idx + bl_idx] +
+                                             [blocks[idx + bl_idx][:-1]], parallel=True, target_output_shape=target_output_shape)
         named_spec[0]._block = '(' + named_spec[0]._block
         named_spec[-1]._block = named_spec[-1]._block + ')'
         return oshape, named_spec, nn

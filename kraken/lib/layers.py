@@ -1,14 +1,20 @@
 """
 Layers for VGSL models
 """
-import torch
-import numpy as np
+import logging
+from typing import Iterable, Optional
 
-from typing import List, Tuple, Optional, Iterable
+import numpy as np
+import torch
 from torch.nn import Module, Sequential
 from torch.nn import functional as F
-from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence
-from coremltools.proto import NeuralNetwork_pb2
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+
+root_logger = logging.getLogger()
+level = root_logger.getEffectiveLevel()
+root_logger.setLevel(logging.ERROR)
+from coremltools.proto import NeuralNetwork_pb2  # NOQA
+root_logger.setLevel(level)
 
 # all tensors are ordered NCHW, the "feature" dimension is C, so the output of
 # an LSTM will be put into C same as the filters of a CNN.
@@ -21,12 +27,15 @@ class MultiParamSequential(Sequential):
     Sequential variant accepting multiple arguments.
     """
 
-    def forward(self, *inputs):
-        for module in self._modules.values():
-            if type(inputs) == tuple:
-                inputs = module(*inputs)
+    def forward(self, *inputs, output_shape: Optional[tuple[int, int]] = None):
+        modules = self._modules.values()
+        i = 0
+        for module in modules:
+            if isinstance(inputs, tuple):
+                inputs = module(*inputs, output_shape=output_shape if i == len(modules) - 1 else None)
             else:
-                inputs = module(inputs)
+                inputs = module(inputs, output_shape=output_shape if i == len(modules) - 1 else None)
+            i += 1
         return inputs
 
 
@@ -34,25 +43,27 @@ class MultiParamParallel(Module):
     """
     Parallel module.
     """
-    def forward(self, *inputs):
+    def forward(self, *inputs, output_shape: Optional[tuple[int, int]] = None):
         outputs = []
         seq_lens = None
         for module in self._modules.values():
-            if type(inputs) == tuple:
-                output, seq_lens = module(*inputs)
+            if isinstance(inputs, tuple):
+                output, seq_lens = module(*inputs, output_shape=output_shape)
                 outputs.append(output)
             else:
-                outputs.append(module(inputs))
+                outputs.append(module(inputs, output_shape=output_shape))
+            if output_shape is None:
+                output_shape = outputs[-1].shape[2:]
         return torch.cat(outputs, dim=1), seq_lens
 
 
 def PeepholeLSTMCell(input: torch.Tensor,
-                     hidden: Tuple[torch.Tensor, torch.Tensor],
+                     hidden: tuple[torch.Tensor, torch.Tensor],
                      w_ih: torch.Tensor,
                      w_hh: torch.Tensor,
                      w_ip: torch.Tensor,
                      w_fp: torch.Tensor,
-                     w_op: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+                     w_op: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """
     An LSTM cell with peephole connections without biases.
 
@@ -125,7 +136,7 @@ class PeepholeBidiLSTM(Module):
 
         self.input_size = input_size
         self.hidden_size = hidden_size
-        self._all_weights = []  # type: List[List[str]]
+        self._all_weights: list[list[str]] = []
         gate_size = 4 * hidden_size
         for direction in range(2):
             w_ih = torch.nn.Parameter(torch.Tensor(gate_size, input_size))
@@ -145,7 +156,7 @@ class PeepholeBidiLSTM(Module):
                 setattr(self, name, param)
             self._all_weights.append(param_names)
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
+    def forward(self, input: torch.Tensor, output_shape: Optional[list[int]] = None) -> torch.Tensor:
         layer = (Recurrent(PeepholeLSTMCell), Recurrent(PeepholeLSTMCell, reverse=True))
         func = StackedRNN(layer, 1, 2)
         input = input.transpose(0, 1)
@@ -177,13 +188,16 @@ class Addition(Module):
         self.chunk_size = chunk_size
         super().__init__()
 
-    def forward(self, inputs: torch.Tensor, seq_len: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def forward(self,
+                inputs: torch.Tensor,
+                seq_len: Optional[torch.Tensor] = None,
+                output_shape: Optional[list[int]] = None) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         out = inputs.unfold(self.dim, self.chunk_size, self.chunk_size)
         out = out.sum(self.dim, keepdim=True)
         out = out.transpose(-1, self.dim).squeeze(-1)
         return out, seq_len
 
-    def get_shape(self, input: Tuple[int, int, int, int]) -> Tuple[int, int, int, int]:
+    def get_shape(self, input: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
         """
         Calculates the output shape from input 4D tuple NCHW.
         """
@@ -227,10 +241,13 @@ class Identity(Module):
         """
         super().__init__()
 
-    def forward(self, inputs: torch.Tensor, seq_len: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def forward(self,
+                inputs: torch.Tensor,
+                seq_len: Optional[torch.Tensor] = None,
+                output_shape: Optional[tuple[int, int]] = None) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         return inputs, seq_len
 
-    def get_shape(self, input: Tuple[int, int, int, int]) -> Tuple[int, int, int, int]:
+    def get_shape(self, input: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
         self.output_shape = input
         return input
 
@@ -279,7 +296,10 @@ class Reshape(Module):
         self.high = high
         self.low = low
 
-    def forward(self, input: torch.Tensor, seq_len: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def forward(self,
+                input: torch.Tensor,
+                seq_len: Optional[torch.Tensor] = None,
+                output_shape: Optional[tuple[int, int]] = None) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         initial_len = input.shape[3]
         # split dimension src_dim into part_a x part_b
         input = input.reshape(input.shape[:self.src_dim] + (self.part_a, self.part_b) + input.shape[self.src_dim + 1:])
@@ -300,11 +320,12 @@ class Reshape(Module):
             seq_len = (seq_len * (float(initial_len)/o.shape[3])).int()
         return o, seq_len
 
-    def get_shape(self, input: Tuple[int, int, int, int]) -> Tuple[int, int, int, int]:
+    def get_shape(self, input: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
         input_shape = torch.zeros([x if x else 1 for x in input])
         with torch.no_grad():
             o, _ = self.forward(input_shape)
-        return tuple(o.shape)  # type: ignore
+        self.output_shape = tuple(o.shape)
+        return self.output_shape  # type: ignore
 
     def deserialize(self, name, spec):
         """
@@ -334,7 +355,7 @@ class MaxPool(Module):
     A simple wrapper for MaxPool layers
     """
 
-    def __init__(self, kernel_size: Tuple[int, int], stride: Tuple[int, int]) -> None:
+    def __init__(self, kernel_size: tuple[int, int], stride: tuple[int, int]) -> None:
         """
         A wrapper around MaxPool layers with serialization and layer arithmetic.
         """
@@ -343,13 +364,16 @@ class MaxPool(Module):
         self.stride = stride
         self.layer = torch.nn.MaxPool2d(kernel_size, stride)
 
-    def forward(self, inputs: torch.Tensor, seq_len: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def forward(self,
+                inputs: torch.Tensor,
+                seq_len: Optional[torch.Tensor] = None,
+                output_shape: Optional[tuple[int, int]] = None) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         o = self.layer(inputs)
         if seq_len is not None:
             seq_len = torch.floor((seq_len-(self.kernel_size[1]-1)-1).float()/self.stride[1]+1).int()
         return o, seq_len
 
-    def get_shape(self, input: Tuple[int, int, int, int]) -> Tuple[int, int, int, int]:
+    def get_shape(self, input: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
         self.output_shape = (input[0],
                              input[1],
                              int(np.floor((input[2]-(self.kernel_size[0]-1)-1)/self.stride[0]+1) if input[2] != 0 else 0),
@@ -392,10 +416,13 @@ class Dropout(Module):
         elif dim == 2:
             self.layer = torch.nn.Dropout2d(p)
 
-    def forward(self, inputs: torch.Tensor, seq_len: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def forward(self,
+                inputs: torch.Tensor,
+                seq_len: Optional[torch.Tensor] = None,
+                output_shape: Optional[tuple[int, int]] = None) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         return self.layer(inputs), seq_len
 
-    def get_shape(self, input: Tuple[int, int, int, int]) -> Tuple[int, int, int, int]:
+    def get_shape(self, input: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
         self.output_shape = input
         return input
 
@@ -437,10 +464,11 @@ class TransposedSummarizingRNN(Module):
         Args:
             input_size:
             hidden_size:
-            direction (str):
-            transpose (bool): Transpose width/height dimension
-            summarize (bool): Only return the last time step.
-            legacy (str): Set to `clstm` for clstm rnns and `ocropy` for ocropus models.
+            direction: Enables bidirectional ('b') or unidirectional mode (any
+                       other value).
+            transpose: Transpose width/height dimension
+            summarize: Only return the last time step.
+            legacy: Set to `clstm` for clstm rnns and `ocropy` for ocropus models.
 
         Shape:
             - Inputs: :math:`(N, C, H, W)` where `N` batches, `C` channels, `H`
@@ -468,7 +496,10 @@ class TransposedSummarizingRNN(Module):
                                        batch_first=True,
                                        bias=False if legacy else True)
 
-    def forward(self, inputs: torch.Tensor, seq_len: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def forward(self,
+                inputs: torch.Tensor,
+                seq_len: Optional[torch.Tensor] = None,
+                output_shape: Optional[tuple[int, int]] = None) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         # NCHW -> HNWC
         inputs = inputs.permute(2, 0, 3, 1)
         if self.transpose:
@@ -501,7 +532,7 @@ class TransposedSummarizingRNN(Module):
             raise Exception('Do not use summarizing layer in x-axis with batching/sequences')
         return o.permute(1, 3, 0, 2), seq_len
 
-    def get_shape(self, input: Tuple[int, int, int, int]) -> Tuple[int, int, int, int]:
+    def get_shape(self, input: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
         """
         Calculates the output shape from input 4D tuple (batch, channel, input_size, seq_len).
         """
@@ -634,16 +665,19 @@ class TransposedSummarizingRNN(Module):
 
 class LinSoftmax(Module):
     """
-    A wrapper for linear projection + softmax dealing with dimensionality mangling.
+    A wrapper for linear projection with dimensionality mangling.
     """
 
-    def __init__(self, input_size: int, output_size: int, augmentation: bool = False) -> None:
+    def __init__(self,
+                 input_size: int,
+                 output_size: int,
+                 augmentation: bool = False) -> None:
         """
 
         Args:
             input_size: Number of inputs in the feature dimension
             output_size: Number of outputs in the feature dimension
-            augmentation (bool): Enables 1-augmentation of input vectors
+            augmentation: Enables 1-augmentation of input vectors
 
         Shape:
             - Inputs: :math:`(N, C, H, W)` where `N` batches, `C` channels, `H`
@@ -660,7 +694,10 @@ class LinSoftmax(Module):
 
         self.lin = torch.nn.Linear(self.input_size, output_size)
 
-    def forward(self, inputs: torch.Tensor, seq_len: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def forward(self,
+                inputs: torch.Tensor,
+                seq_len: Optional[torch.Tensor] = None,
+                output_shape: Optional[tuple[int, int]] = None) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         # move features (C) to last dimension for linear activation
         # NCHW -> NWHC
         inputs = inputs.transpose(1, 3)
@@ -668,15 +705,10 @@ class LinSoftmax(Module):
         if self.augmentation:
             inputs = torch.cat([torch.ones(inputs.shape[:3] + (1,)), inputs], dim=3)
         o = self.lin(inputs)
-        # switch between log softmax (needed by ctc) and regular (for inference).
-        if not self.training:
-            o = F.softmax(o, dim=3)
-        else:
-            o = F.log_softmax(o, dim=3)
         # and swap again
         return o.transpose(1, 3), seq_len
 
-    def get_shape(self, input: Tuple[int, int, int, int]) -> Tuple[int, int, int, int]:
+    def get_shape(self, input: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
         """
         Calculates the output shape from input 4D tuple NCHW.
         """
@@ -699,12 +731,10 @@ class LinSoftmax(Module):
         Serializes the module using a NeuralNetworkBuilder.
         """
         lin_name = '{}_lin'.format(name)
-        softmax_name = '{}_softmax'.format(name)
         builder.add_inner_product(lin_name, self.lin.weight.data.numpy(),
                                   self.lin.bias.data.numpy(),
                                   self.input_size, self.output_size,
                                   has_bias=True, input_name=input, output_name=lin_name)
-        builder.add_softmax(softmax_name, lin_name, name)
         return name
 
     def resize(self, output_size: int, del_indices: Optional[Iterable[int]] = None) -> None:
@@ -717,7 +747,7 @@ class LinSoftmax(Module):
 
         Args:
             output_size (int): Desired output size after resizing
-            del_indices (list): List of connection to outputs to remove.
+            del_indices (list): list of connection to outputs to remove.
         """
         if not del_indices:
             del_indices = []
@@ -741,13 +771,23 @@ class ActConv2D(Module):
     dropped columns.
     """
 
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: Tuple[int, int], stride: Tuple[int, int], nl: str = 'l') -> None:
+    def __init__(self,
+                 in_channels: int,
+                 out_channels: int,
+                 kernel_size: tuple[int, int],
+                 stride: tuple[int, int],
+                 nl: str = 'l',
+                 dilation: tuple[int, int] = (1, 1),
+                 transposed: bool = False) -> None:
         super().__init__()
         self.in_channels = in_channels
         self.kernel_size = kernel_size
         self.out_channels = out_channels
         self.stride = stride
-        self.padding = tuple((k - 1) // 2 for k in kernel_size)
+        self.dilation = dilation
+        self.padding = tuple((dilation[i] * (kernel_size[i] - 1)) // 2 for i in range(2))
+        self.transposed = transposed
+
         if nl == 's':
             self.nl = torch.sigmoid
             self.nl_name = 'SIGMOID'
@@ -760,26 +800,70 @@ class ActConv2D(Module):
         elif nl == 'r':
             self.nl = torch.relu
             self.nl_name = 'RELU'
+        elif nl == 'lr':
+            self.nl = torch.nn.LeakyReLU()
+            self.nl_name = 'LEAKYRELU'
         else:
             self.nl_name = 'LINEAR'
             self.nl = lambda x: x
-        self.co = torch.nn.Conv2d(in_channels, out_channels, kernel_size,
-                                  stride=stride, padding=self.padding)
 
-    def forward(self, inputs: torch.Tensor, seq_len: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        o = self.co(inputs)
-        o = self.nl(o)
+        if self.transposed:
+            self.co = torch.nn.ConvTranspose2d(in_channels,
+                                               out_channels,
+                                               kernel_size,
+                                               stride=stride,
+                                               padding=self.padding,
+                                               dilation=self.dilation)
+        else:
+            self.co = torch.nn.Conv2d(in_channels,
+                                      out_channels,
+                                      kernel_size,
+                                      stride=stride,
+                                      padding=self.padding,
+                                      dilation=self.dilation)
+
+    def forward(self,
+                inputs: torch.Tensor,
+                seq_len: Optional[torch.Tensor] = None,
+                output_shape: Optional[tuple[int, int]] = None) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if self.transposed:
+            o = self.co(inputs, output_size=output_shape)
+        else:
+            o = self.co(inputs)
+        # return logits for sigmoid activation during training
+        if not (self.nl_name == 'SIGMOID' and self.training):
+            o = self.nl(o)
+
         if seq_len is not None:
-            seq_len = torch.clamp(torch.floor(
-                (seq_len+2*self.padding[1]-(self.kernel_size[1]-1)-1).float()/self.stride[1]+1), min=1).int()
+            if self.transposed:
+                seq_len = torch.floor(
+                    ((seq_len - 1) * self.stride[1]
+                        - 2 * self.padding[1]
+                        + self.dilation[1] * (self.kernel_size[1] - 1)
+                        + 1))
+            else:
+                seq_len = torch.clamp(torch.floor(
+                    (seq_len+2*self.padding[1]-self.dilation[1]*(self.kernel_size[1]-1)-1).float()/self.stride[1]+1), min=1).int()
         return o, seq_len
 
-    def get_shape(self, input: Tuple[int, int, int, int]) -> Tuple[int, int, int, int]:
-        self.output_shape = (input[0],
-                             self.out_channels,
-                             int(max(np.floor((input[2]+2*self.padding[0]-(self.kernel_size[0]-1)-1) /
-                                 self.stride[0]+1), 1) if input[2] != 0 else 0),
-                             int(max(np.floor((input[3]+2*self.padding[1]-(self.kernel_size[1]-1)-1)/self.stride[1]+1), 1) if input[3] != 0 else 0))
+    def get_shape(self, input: tuple[int, int, int, int], target_shape: Optional[tuple[int, int, int, int]] = None) -> tuple[int, int, int, int]:
+        if self.transposed:
+            """ For transposed convolution, there is some flexibility. """
+            min_y = int((input[2] - 1) * self.stride[0] - 2 * self.padding[0] + self.dilation[0] * (self.kernel_size[0] - 1) + 1 if input[2] != 0 else 0)
+            target_y = min_y if not target_shape or target_shape[2] == 0 else target_shape[2]
+            min_x = int((input[3] - 1) * self.stride[1] - 2 * self.padding[1] + self.dilation[1] * (self.kernel_size[1] - 1) + 1 if input[3] != 0 else 0)
+            target_x = min_x if not target_shape or target_shape[3] == 0 else target_shape[3]
+            self.output_shape = (input[0],
+                                 self.out_channels,
+                                 min(min_y + self.stride[0] - 1, max(target_y, min_y)),
+                                 min(min_x + self.stride[1] - 1, max(target_x, min_x)))
+        else:
+            self.output_shape = (input[0],
+                                 self.out_channels,
+                                 int(max(np.floor((input[2]+2*self.padding[0]-self.dilation[0]*(self.kernel_size[0]-1)-1) /
+                                     self.stride[0]+1), 1) if input[2] != 0 else 0),
+                                 int(max(np.floor((input[3]+2*self.padding[1]-self.dilation[1]*(self.kernel_size[1]-1)-1) /
+                                     self.stride[1]+1), 1) if input[3] != 0 else 0))
         return self.output_shape
 
     def deserialize(self, name: str, spec) -> None:
@@ -787,9 +871,14 @@ class ActConv2D(Module):
         Sets the weight of an initialized model from a CoreML protobuf spec.
         """
         conv = [x for x in spec.neuralNetwork.layers if x.name == '{}_conv'.format(name)][0].convolution
-        self.co.weight = torch.nn.Parameter(torch.Tensor(conv.weights.floatValue).view(self.out_channels,
-                                                                                       self.in_channels,
-                                                                                       *self.kernel_size))
+        if self.transposed:
+            self.co.weight = torch.nn.Parameter(torch.Tensor(conv.weights.floatValue).view(self.in_channels,
+                                                                                           self.out_channels,
+                                                                                           *self.kernel_size))
+        else:
+            self.co.weight = torch.nn.Parameter(torch.Tensor(conv.weights.floatValue).view(self.out_channels,
+                                                                                           self.in_channels,
+                                                                                           *self.kernel_size))
         self.co.bias = torch.nn.Parameter(torch.Tensor(conv.bias.floatValue))
 
     def serialize(self, name: str, input: str, builder) -> str:
@@ -798,6 +887,7 @@ class ActConv2D(Module):
         """
         conv_name = '{}_conv'.format(name)
         act_name = '{}_act'.format(name)
+        W = self.co.weight.permute(2, 3, 0, 1).data.numpy() if self.transposed else self.co.weight.permute(2, 3, 1, 0).data.numpy()
         builder.add_convolution(name=conv_name,
                                 kernel_channels=self.in_channels,
                                 output_channels=self.out_channels,
@@ -805,15 +895,17 @@ class ActConv2D(Module):
                                 width=self.kernel_size[1],
                                 stride_height=self.stride[0],
                                 stride_width=self.stride[1],
+                                dilation_factors=self.dilation,
                                 border_mode='same',
                                 groups=1,
-                                W=self.co.weight.permute(2, 3, 1, 0).data.numpy(),
+                                W=W,
                                 b=self.co.bias.data.numpy(),
                                 has_bias=True,
+                                is_deconv=self.transposed,
                                 input_name=input,
                                 output_name=conv_name)
         if self.nl_name != 'SOFTMAX':
-            builder.add_activation(act_name, self.nl_name, conv_name, name)
+            builder.add_activation(act_name, self.nl_name, conv_name, name, params=None if self.nl_name != 'LEAKYRELU' else [self.nl.negative_slope])
         else:
             builder.add_softmax(act_name, conv_name, name)
         return name
@@ -826,8 +918,8 @@ class ActConv2D(Module):
         resizes both tensors to a new output size.
 
         Args:
-            output_size (int): Desired output dimensionality after resizing
-            del_indices (list): List of connection to outputs to remove.
+            output_size: Desired output dimensionality after resizing
+            del_indices: list of connection to outputs to remove.
         """
         if not del_indices:
             del_indices = []
@@ -841,8 +933,12 @@ class ActConv2D(Module):
         weight = torch.cat([weight, rweight], dim=0)
         bias = self.co.bias.index_select(0, idx)
         bias = torch.cat([bias, torch.zeros(output_size - bias.size(0))])
-        self.co = torch.nn.Conv2d(self.in_channels, self.out_channels, self.kernel_size,
-                                  stride=self.stride, padding=self.padding)
+        if self.transposed:
+            self.co = torch.nn.ConvTranspose2d(self.in_channels, self.out_channels, self.kernel_size,
+                                               stride=self.stride, padding=self.padding)
+        else:
+            self.co = torch.nn.Conv2d(self.in_channels, self.out_channels, self.kernel_size,
+                                      stride=self.stride, padding=self.padding)
         self.co.weight = torch.nn.Parameter(weight)
         self.co.bias = torch.nn.Parameter(bias)
 
@@ -859,12 +955,19 @@ class GroupNorm(Module):
 
         self.layer = torch.nn.GroupNorm(num_groups, in_channels)
 
-    def forward(self, inputs: torch.Tensor, seq_len: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        o = self.layer(inputs)
-        return o, seq_len
+    def forward(self,
+                inputs: torch.Tensor,
+                seq_len: Optional[torch.Tensor],
+                output_shape: Optional[tuple[int, int]] = None) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        t = inputs.dtype
+        # XXX: verify that pytorch AMP casts the inputs to float32 correctly at
+        # some point.
+        o = self.layer(inputs.type(torch.float32))
+        return o.type(t), seq_len
 
-    def get_shape(self, input: Tuple[int, int, int, int]) -> Tuple[int, int, int, int]:
-        return input
+    def get_shape(self, input: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+        self.output_shape = input
+        return self.output_shape  # type: ignore
 
     def deserialize(self, name: str, spec) -> None:
         """

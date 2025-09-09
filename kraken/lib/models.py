@@ -5,17 +5,21 @@ kraken.lib.models
 Wrapper around TorchVGSLModel including a variety of forward pass helpers for
 sequence classification.
 """
-from os.path import expandvars, expanduser, abspath
+from os.path import abspath, expanduser, expandvars
+from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
 import numpy as np
-import kraken.lib.lineest
+
 import kraken.lib.ctc_decoder
-
-from typing import List, Tuple, Optional, Union
-
+import kraken.lib.lineest
+from kraken.lib.exceptions import (KrakenInputException,
+                                   KrakenInvalidModelException)
 from kraken.lib.vgsl import TorchVGSLModel
-from kraken.lib.exceptions import KrakenInvalidModelException, KrakenInputException
+
+if TYPE_CHECKING:
+    from os import PathLike
+
 
 __all__ = ['TorchSeqRecognizer', 'load_any']
 
@@ -28,12 +32,18 @@ class TorchSeqRecognizer(object):
     """
     A wrapper class around a TorchVGSLModel for text recognition.
     """
-    def __init__(self, nn: TorchVGSLModel, decoder=kraken.lib.ctc_decoder.greedy_decoder, train: bool = False, device: str = 'cpu'):
+    def __init__(self,
+                 nn: TorchVGSLModel,
+                 decoder=kraken.lib.ctc_decoder.greedy_decoder,
+                 temperature: float = 1.0,
+                 train: bool = False,
+                 device: str = 'cpu'):
         """
         Constructs a sequence recognizer from a VGSL model and a decoder.
 
         Args:
             nn: Neural network used for recognition.
+            temperature: Softmax temperature.
             decoder: Decoder function used for mapping softmax activations to
                      labels and positions.
             train: Enables or disables gradient calculation and dropout.
@@ -63,6 +73,7 @@ class TorchSeqRecognizer(object):
             self.nn.eval()
         self.codec = self.nn.codec
         self.decoder = decoder
+        self.temperature = temperature
         self.train = train
         self.device = device
         if nn.model_type not in [None, 'recognition']:
@@ -79,7 +90,7 @@ class TorchSeqRecognizer(object):
         self.device = device
         self.nn.to(device)
 
-    def forward(self, line: torch.Tensor, lens: torch.Tensor = None) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
+    def forward(self, line: torch.Tensor, lens: torch.Tensor = None) -> Union[np.ndarray, tuple[np.ndarray, np.ndarray]]:
         """
         Performs a forward pass on a torch tensor of one or more lines with
         shape (N, C, H, W) and returns a numpy array (N, W, C).
@@ -89,7 +100,7 @@ class TorchSeqRecognizer(object):
             lens: Optional tensor containing sequence lengths if N > 1
 
         Returns:
-            Tuple with (N, W, C) shaped numpy array and final output sequence
+            tuple with (N, W, C) shaped numpy array and final output sequence
             lengths.
 
         Raises:
@@ -101,12 +112,13 @@ class TorchSeqRecognizer(object):
         o, olens = self.nn.nn(line, lens)
         if o.size(2) != 1:
             raise KrakenInputException('Expected dimension 3 to be 1, actual {}'.format(o.size()))
-        self.outputs = o.detach().squeeze(2).cpu().numpy()
+        o = (o/self.temperature).softmax(1)
+        self.outputs = o.detach().squeeze(2).float().cpu().numpy()
         if olens is not None:
             olens = olens.cpu().numpy()
         return self.outputs, olens
 
-    def predict(self, line: torch.Tensor, lens: Optional[torch.Tensor] = None) -> List[List[Tuple[str, int, int, float]]]:
+    def predict(self, line: torch.Tensor, lens: Optional[torch.Tensor] = None) -> List[List[tuple[str, int, int, float]]]:
         """
         Performs a forward pass on a torch tensor of a line with shape (N, C, H, W)
         and returns the decoding as a list of tuples (string, start, end,
@@ -137,7 +149,7 @@ class TorchSeqRecognizer(object):
 
         Args:
             line: NCHW line tensor
-            lens: Optional tensor
+            lens: Optional tensor containing the sequence lengths of the input batch.
         """
         o, olens = self.forward(line, lens)
         dec_strs = []
@@ -150,7 +162,7 @@ class TorchSeqRecognizer(object):
             dec_strs.append(''.join(x[0] for x in self.codec.decode(locs)))
         return dec_strs
 
-    def predict_labels(self, line: torch.tensor, lens: torch.Tensor = None) -> List[List[Tuple[int, int, int, float]]]:
+    def predict_labels(self, line: torch.tensor, lens: torch.Tensor = None) -> List[List[tuple[int, int, int, float]]]:
         """
         Performs a forward pass on a torch tensor of a line with shape (N, C, H, W)
         and returns a list of tuples (class, start, end, max). Max is the
@@ -166,7 +178,9 @@ class TorchSeqRecognizer(object):
         return oseqs
 
 
-def load_any(fname: str, train: bool = False, device: str = 'cpu') -> TorchSeqRecognizer:
+def load_any(fname: Union['PathLike', str],
+             train: bool = False,
+             device: str = 'cpu') -> TorchSeqRecognizer:
     """
     Loads anything that was, is, and will be a valid ocropus model and
     instantiates a shiny new kraken.lib.lstm.SeqRecognizer from the RNN
@@ -174,18 +188,13 @@ def load_any(fname: str, train: bool = False, device: str = 'cpu') -> TorchSeqRe
 
     Currently it recognizes the following kinds of models:
 
-        * protobuf models containing converted python BIDILSTMs (recognition
-          only)
-        * protobuf models containing CLSTM networks (recognition only)
-        * protobuf models containing VGSL segmentation and recognitino
+        * protobuf models containing VGSL segmentation and recognition
           networks.
 
     Additionally an attribute 'kind' will be added to the SeqRecognizer
     containing a string representation of the source kind. Current known values
     are:
 
-        * pyrnn for pickled BIDILSTMs
-        * clstm for protobuf models generated by clstm
         * vgsl for VGSL models
 
     Args:
@@ -200,26 +209,14 @@ def load_any(fname: str, train: bool = False, device: str = 'cpu') -> TorchSeqRe
         KrakenInvalidModelException: if the model is not loadable by any parser.
     """
     nn = None
-    kind = ''
     fname = abspath(expandvars(expanduser(fname)))
     logger.info('Loading model from {}'.format(fname))
     try:
         nn = TorchVGSLModel.load_model(str(fname))
-        kind = 'vgsl'
-    except Exception:
-        try:
-            nn = TorchVGSLModel.load_clstm_model(fname)
-            kind = 'clstm'
-        except Exception:
-            try:
-                nn = TorchVGSLModel.load_pronn_model(fname)
-                kind = 'pronn'
-            except Exception:
-                pass
-    if not nn:
-        raise KrakenInvalidModelException('File {} not loadable by any parser.'.format(fname))
+    except Exception as e:
+        raise KrakenInvalidModelException('File {} not loadable by any parser.'.format(fname)) from e
     seq = TorchSeqRecognizer(nn, train=train, device=device)
-    seq.kind = kind
+    seq.kind = 'vgsl'
     return seq
 
 
@@ -227,6 +224,6 @@ def validate_hyper_parameters(hyper_params):
     """
     Validate some model's hyper parameters and modify them in place if need be.
     """
-    if (hyper_params['quit'] == 'dumb' and hyper_params['completed_epochs'] >= hyper_params['epochs']):
+    if (hyper_params['quit'] == 'fixed' and hyper_params['completed_epochs'] >= hyper_params['epochs']):
         logger.warning('Maximum epochs reached (might be loaded from given model), starting again from 0.')
         hyper_params['completed_epochs'] = 0

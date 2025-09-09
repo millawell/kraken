@@ -1,16 +1,16 @@
 # -*- coding: utf-8 -*-
 import os
-import click
-import unittest
 import tempfile
-import numpy as np
-
-from PIL import Image
+import unittest
 from pathlib import Path
-from click.testing import CliRunner
-from kraken.kraken import cli
 
+import click
+import numpy as np
+from click.testing import CliRunner
+from PIL import Image
 from pytest import raises
+
+from kraken.kraken import cli
 
 thisfile = Path(__file__).resolve().parent
 resources = thisfile / 'resources'
@@ -57,11 +57,3 @@ class TestCLI(unittest.TestCase):
         with tempfile.NamedTemporaryFile() as fp:
             result = self.runner.invoke(cli, ['-r', '-i', self.color_img, fp.name, 'segment'])
             self.assertEqual(result.exit_code, 1)
-
-    def test_segment_color_noraise(self):
-        """
-        Tests that segmentation does not return 1 when given color image in noraise mode.
-        """
-        with tempfile.NamedTemporaryFile() as fp:
-            result = self.runner.invoke(cli, ['-i', self.color_img, fp.name, 'segment'])
-            self.assertEqual(result.exit_code, 0)

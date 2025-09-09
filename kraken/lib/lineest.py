@@ -1,9 +1,11 @@
 import warnings
-from PIL import Image
-import numpy as np
+from typing import TYPE_CHECKING
 
-from kraken.lib.util import pil2array, array2pil
-from scipy.ndimage import interpolation, filters
+import numpy as np
+from scipy.ndimage import affine_transform, gaussian_filter, uniform_filter
+
+if TYPE_CHECKING:
+    from PIL import Image
 
 __all__ = ['CenterNormalizer', 'dewarp']
 
@@ -14,11 +16,9 @@ def scale_to_h(img, target_height, order=1, dtype=np.dtype('f'), cval=0):
     target_width = int(scale*w)
     with warnings.catch_warnings():
         warnings.simplefilter('ignore', UserWarning)
-        output = interpolation.affine_transform(1.0*img, np.ones(2)/scale,
-                                                order=order,
-                                                output_shape=(target_height,
-                                                              target_width),
-                                                mode='constant', cval=cval)
+        output = affine_transform(1.0*img, np.ones(2)/scale, order=order,
+                                  output_shape=(target_height, target_width),
+                                  mode='constant', cval=cval)
     output = np.array(output, dtype=dtype)
     return output
 
@@ -34,13 +34,12 @@ class CenterNormalizer(object):
     def measure(self, line):
         h, w = line.shape
         # XXX: this filter is awfully slow
-        smoothed = filters.gaussian_filter(line, (h*0.5, h*self.smoothness),
-                                           mode='constant')
-        smoothed += 0.001*filters.uniform_filter(smoothed, (h*0.5, w),
-                                                 mode='constant')
+        smoothed = gaussian_filter(line, (h*0.5, h*self.smoothness),
+                                   mode='constant')
+        smoothed += 0.001*uniform_filter(smoothed, (h*0.5, w), mode='constant')
         self.shape = (h, w)
         a = np.argmax(smoothed, axis=0)
-        a = filters.gaussian_filter(a, h*self.extra)
+        a = gaussian_filter(a, h*self.extra)
         self.center = np.array(a, 'i')
         deltas = np.abs(np.arange(h)[:, np.newaxis]-self.center[np.newaxis, :])
         self.mad = np.mean(deltas[line != 0])
@@ -66,19 +65,20 @@ class CenterNormalizer(object):
         return scaled
 
 
-def dewarp(normalizer: CenterNormalizer, im: Image.Image) -> Image.Image:
+def dewarp(normalizer: CenterNormalizer, im: 'Image.Image') -> 'Image.Image':
     """
     Dewarps an image of a line using a kraken.lib.lineest.CenterNormalizer
     instance.
 
     Args:
-        normalizer (kraken.lib.lineest.CenterNormalizer): A line normalizer
-                                                          instance
-        im (PIL.Image.Image): Image to dewarp
+        normalizer: A line normalizer instance
+        im: Image to dewarp
 
     Returns:
-        PIL.Image containing the dewarped image.
+        PIL.Image.Image containing the dewarped image.
     """
+    from kraken.lib.util import array2pil, pil2array
+
     line = pil2array(im)
     temp = np.amax(line)-line
     temp = temp*1.0/np.amax(temp)

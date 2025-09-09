@@ -1,14 +1,16 @@
 #!/usr/bin/env python
 """
 Draws a transparent overlay of the forced alignment output over the input
-image. Needs OpenFST bindings installed.
+image.
 """
-import re
 import os
-import click
+import re
 import unicodedata
-from lxml import etree
 from itertools import cycle
+from unicodedata import normalize
+
+import click
+from lxml import etree
 
 cmap = cycle([(230, 25, 75, 127),
               (60, 180, 75, 127),
@@ -29,25 +31,28 @@ def slugify(value):
     value = re.sub(r'[-\s]+', '-', value)
     return value
 
+
 def _repl_alto(fname, cuts):
     with open(fname, 'rb') as fp:
         doc = etree.parse(fp)
         lines = doc.findall('.//{*}TextLine')
         char_idx = 0
-        for line, line_cuts in zip(lines, cuts):
+        for line, line_cuts in zip(lines, cuts.lines):
             idx = 0
             for el in line:
                 if el.tag.endswith('Shape'):
                     continue
                 elif el.tag.endswith('SP'):
-                    idx +=1
+                    idx += 1
                 elif el.tag.endswith('String'):
                     str_len = len(el.get('CONTENT'))
-                    # clear out all 
+                    # clear out all
                     for chld in el:
                         if chld.tag.endswith('Glyph'):
                             el.remove(chld)
-                    for char in line_cuts[idx:str_len]:
+                    for char in zip(line_cuts.prediction[idx:str_len],
+                                    line_cuts.cuts[idx:str_len],
+                                    line_cuts.confidences[idx:str_len]):
                         glyph = etree.SubElement(el, 'Glyph')
                         glyph.set('ID', f'char_{char_idx}')
                         char_idx += 1
@@ -59,16 +64,18 @@ def _repl_alto(fname, cuts):
         with open(f'{os.path.basename(fname)}_algn.xml', 'wb') as fp:
             doc.write(fp, encoding='UTF-8', xml_declaration=True)
 
+
 def _repl_page(fname, cuts):
     with open(fname, 'rb') as fp:
         doc = etree.parse(fp)
         lines = doc.findall('.//{*}TextLine')
-        for line, line_cuts in zip(lines, cuts):
+        for line, line_cuts in zip(lines, cuts.lines):
             glyphs = line.findall('../{*}Glyph/{*}Coords')
             for glyph, cut in zip(glyphs, line_cuts):
                 glyph.attrib['points'] = ' '.join([','.join([str(x) for x in pt]) for pt in cut])
         with open(f'{os.path.basename(fname)}_algn.xml', 'wb') as fp:
             doc.write(fp, encoding='UTF-8', xml_declaration=True)
+
 
 @click.command()
 @click.option('-f', '--format-type', type=click.Choice(['alto', 'page']), default='page',
@@ -77,11 +84,14 @@ def _repl_page(fname, cuts):
               'link to source images.')
 @click.option('-i', '--model', default=None, show_default=True, type=click.Path(exists=True),
               help='Transcription model to use.')
+@click.option('-u', '--normalization', show_default=True, type=click.Choice(['NFD', 'NFKD', 'NFC', 'NFKC']),
+              default=None,
+              help='Ground truth normalization')
 @click.option('-o', '--output', type=click.Choice(['xml', 'overlay']),
               show_default=True, default='overlay', help='Output mode. Either page or '
               'alto for xml output, overlay for image overlays.')
 @click.argument('files', nargs=-1)
-def cli(format_type, model, output, files):
+def cli(format_type, model, normalization, output, files):
     """
     A script producing overlays of lines and regions from either ALTO or
     PageXML files or run a model to do the same.
@@ -93,35 +103,41 @@ def cli(format_type, model, output, files):
 
     from PIL import Image, ImageDraw
 
-    from kraken.lib import models, xml
-    from kraken import align, serialization
+    from kraken import align
+    from kraken.lib import models
+    from kraken.lib.xml import XMLPage
 
     if format_type == 'alto':
-        fn = xml.parse_alto
         repl_fn = _repl_alto
     else:
-        fn = xml.parse_page
         repl_fn = _repl_page
+
     click.echo(f'Loading model {model}')
     net = models.load_any(model)
 
     for doc in files:
         click.echo(f'Processing {doc} ', nl=False)
-        data = fn(doc)
-        im = Image.open(data['image']).convert('RGBA')
-        records = align.forced_align(data, net)
+        data = XMLPage(doc)
+        im = Image.open(data.imagename).convert('RGBA')
+        result = align.forced_align(data.to_container(), net)
+        if normalization:
+            for line in data._lines:
+                line["text"] = normalize(normalization, line["text"])
+        im = Image.open(data.imagename).convert('RGBA')
+        result = align.forced_align(data.to_container(), net)
         if output == 'overlay':
             tmp = Image.new('RGBA', im.size, (0, 0, 0, 0))
             draw = ImageDraw.Draw(tmp)
-            for record in records:
+            for record in result.lines:
                 for pol in record.cuts:
                     c = next(cmap)
                     draw.polygon([tuple(x) for x in pol], fill=c, outline=c[:3])
             base_image = Image.alpha_composite(im, tmp)
             base_image.save(f'high_{os.path.basename(doc)}_algn.png')
         else:
-            repl_fn(doc, records)
+            repl_fn(doc, result)
         click.secho('\u2713', fg='green')
+
 
 if __name__ == '__main__':
     cli()

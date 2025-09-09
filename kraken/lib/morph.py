@@ -2,7 +2,9 @@
 Various add-ons to the SciPy morphology package
 """
 import numpy as np
-from scipy.ndimage import morphology, measurements, filters
+from scipy.ndimage import distance_transform_edt, filters
+from scipy.ndimage import find_objects as _find_objects
+from scipy.ndimage import label as _label
 
 
 def label(image: np.ndarray, **kw) -> np.ndarray:
@@ -12,17 +14,17 @@ def label(image: np.ndarray, **kw) -> np.ndarray:
     types it accepts on different platforms.
     """
     try:
-        return measurements.label(image, **kw)
+        return _label(image, **kw)
     except Exception:
         pass
     types = ["int32", "uint32", "int64", "uint64", "int16", "uint16"]
     for t in types:
         try:
-            return measurements.label(np.array(image, dtype=t), **kw)
+            return _label(np.array(image, dtype=t), **kw)
         except Exception:
             pass
     # let it raise the same exception as before
-    return measurements.label(image, **kw)
+    return _label(image, **kw)
 
 
 def find_objects(image: np.ndarray, **kw) -> np.ndarray:
@@ -32,17 +34,17 @@ def find_objects(image: np.ndarray, **kw) -> np.ndarray:
     the data types it accepts on different platforms.
     """
     try:
-        return measurements.find_objects(image, **kw)
+        return _find_objects(image, **kw)
     except Exception:
         pass
     types = ["int32", "uint32", "int64", "uint64", "int16", "uint16"]
     for t in types:
         try:
-            return measurements.find_objects(np.array(image, dtype=t), **kw)
+            return _find_objects(np.array(image, dtype=t), **kw)
         except Exception:
             pass
     # let it raise the same exception as before
-    return measurements.find_objects(image, **kw)
+    return _find_objects(image, **kw)
 
 
 def r_dilation(image, size, origin=0):
@@ -79,9 +81,9 @@ def rb_opening(image, size, origin=0):
 
 def spread_labels(labels, maxdist=9999999):
     """Spread the given labels to the background"""
-    distances, features = morphology.distance_transform_edt(labels == 0,
-                                                            return_distances=1,
-                                                            return_indices=1)
+    distances, features = distance_transform_edt(labels == 0,
+                                                 return_distances=1,
+                                                 return_indices=1)
     indexes = features[0] * labels.shape[1] + features[1]
     spread = labels.ravel()[indexes.ravel()].reshape(*labels.shape)
     spread *= (distances < maxdist)

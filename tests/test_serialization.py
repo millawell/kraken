@@ -1,16 +1,17 @@
 # -*- coding: utf-8 -*-
 import json
-import unittest
 import tempfile
-import numpy as np
-
-from lxml import etree
+import unittest
+import uuid
+from collections import Counter
 from io import StringIO
 from pathlib import Path
-from hocr_spec import HocrValidator
-from collections import Counter
 
-from kraken import rpred, serialization
+import numpy as np
+from hocr_spec import HocrValidator
+from lxml import etree
+
+from kraken import containers, serialization
 from kraken.lib import xml
 
 thisfile = Path(__file__).resolve().parent
@@ -24,10 +25,10 @@ def roundtrip(self, records, fp):
     with tempfile.NamedTemporaryFile() as out:
         fp.seek(0)
         out.write(fp.getvalue().encode('utf-8'))
-        doc = xml.parse_xml(out.name)['lines']
+        doc = xml.XMLPage(out.name).to_container().lines
         for orig_line, parsed_line in zip(records, doc):
             self.assertSequenceEqual(np.array(orig_line.baseline).tolist(),
-                                     np.array(parsed_line['baseline']).tolist(),
+                                     np.array(parsed_line.baseline).tolist(),
                                      msg='Baselines differ after serialization.')
 
 def validate_hocr(self, fp):
@@ -62,7 +63,7 @@ def validate_alto(self, fp):
     counts = Counter(ids)
     self.assertEqual(counts.most_common(1)[0][1], 1, msg='Duplicate IDs in ALTO output')
 
-    with open(resources / 'alto-4-2.xsd') as schema_fp:
+    with open(resources / 'alto-4-3.xsd') as schema_fp:
         alto_schema = etree.XMLSchema(etree.parse(schema_fp))
         alto_schema.assertValid(doc)
 
@@ -73,12 +74,57 @@ class TestSerializations(unittest.TestCase):
     """
     def setUp(self):
         with open(resources /'records.json', 'r') as fp:
-            self.box_records = [rpred.ocr_record(**x) for x in json.load(fp)]
+            self.box_records = [containers.BBoxOCRRecord(**x) for x in json.load(fp)]
 
         with open(resources / 'bl_records.json', 'r') as fp:
             recs = json.load(fp)
-            self.bl_records = [rpred.ocr_record(**bl) for bl in recs['lines']]
+            self.bl_records = [containers.BaselineOCRRecord(**bl) for bl in recs['lines']]
             self.bl_regions = recs['regions']
+
+        self.box_segmentation = containers.Segmentation(type='bbox',
+                                                        imagename='foo.png',
+                                                        text_direction='horizontal-lr',
+                                                        lines=self.box_records,
+                                                        script_detection=True,
+                                                        regions={})
+
+        self.bl_segmentation = containers.Segmentation(type='baselines',
+                                                       imagename='foo.png',
+                                                       text_direction='horizontal-lr',
+                                                       lines=self.bl_records,
+                                                       script_detection=True,
+                                                       regions={})
+
+        self.bl_segmentation_regs = containers.Segmentation(type='baselines',
+                                                            imagename='foo.png',
+                                                            text_direction='horizontal-lr',
+                                                            lines=self.bl_records,
+                                                            script_detection=True,
+                                                            regions=self.bl_regions)
+
+        self.bl_seg_nolines_regs = containers.Segmentation(type='baselines',
+                                                           imagename='foo.png',
+                                                           text_direction='horizontal-lr',
+                                                           script_detection=False,
+                                                           lines=[],
+                                                           regions=self.bl_regions)
+
+        self.metadata_steps = [containers.ProcessingStep(id=str(uuid.uuid4()),
+                                                         category='preprocessing',
+                                                         description='PDF image extraction',
+                                                         settings={}),
+                               containers.ProcessingStep(id=str(uuid.uuid4()),
+                                                         category='processing',
+                                                         description='Baseline and region segmentation',
+                                                         settings={'model': 'foo.mlmodel', 'text_direction': 'horizontal-lr'}),
+                               containers.ProcessingStep(id=str(uuid.uuid4()),
+                                                         category='processing',
+                                                         description='Text line recognition',
+                                                         settings={'text_direction': 'horizontal-lr',
+                                                                   'models': 'bar.mlmodel',
+                                                                   'pad': 16,
+                                                                   'bidi_reordering': True})]
+
 
     def test_box_vertical_hocr_serialization(self):
         """
@@ -86,7 +132,7 @@ class TestSerializations(unittest.TestCase):
         """
         fp = StringIO()
 
-        fp.write(serialization.serialize(self.box_records, image_name='foo.png', writing_mode='vertical-lr', template='hocr'))
+        fp.write(serialization.serialize(self.box_segmentation, writing_mode='vertical-lr', template='hocr'))
         validate_hocr(self, fp)
 
     def test_box_hocr_serialization(self):
@@ -95,7 +141,7 @@ class TestSerializations(unittest.TestCase):
         """
         fp = StringIO()
 
-        fp.write(serialization.serialize(self.box_records, image_name='foo.png', template='hocr'))
+        fp.write(serialization.serialize(self.box_segmentation, template='hocr'))
         validate_hocr(self, fp)
 
     def test_box_alto_serialization_validation(self):
@@ -104,7 +150,7 @@ class TestSerializations(unittest.TestCase):
         """
         fp = StringIO()
 
-        fp.write(serialization.serialize(self.box_records, image_name='foo.png', template='alto'))
+        fp.write(serialization.serialize(self.box_segmentation, template='alto'))
         validate_alto(self, fp)
 
     def test_box_abbyyxml_serialization_validation(self):
@@ -113,7 +159,7 @@ class TestSerializations(unittest.TestCase):
         """
         fp = StringIO()
 
-        fp.write(serialization.serialize(self.box_records, image_name='foo.png', template='abbyyxml'))
+        fp.write(serialization.serialize(self.box_segmentation, template='abbyyxml'))
         doc = etree.fromstring(fp.getvalue().encode('utf-8'))
         with open(resources / 'FineReader10-schema-v1.xml') as schema_fp:
             abbyy_schema = etree.XMLSchema(etree.parse(schema_fp))
@@ -125,7 +171,7 @@ class TestSerializations(unittest.TestCase):
         """
         fp = StringIO()
 
-        fp.write(serialization.serialize(self.box_records, image_name='foo.png', template='pagexml'))
+        fp.write(serialization.serialize(self.box_segmentation, template='pagexml'))
         validate_page(self, fp)
 
     def test_bl_alto_serialization_validation(self):
@@ -134,7 +180,7 @@ class TestSerializations(unittest.TestCase):
         """
         fp = StringIO()
 
-        fp.write(serialization.serialize(self.bl_records, image_name='foo.png', template='alto'))
+        fp.write(serialization.serialize(self.bl_segmentation, template='alto'))
         validate_alto(self, fp)
         roundtrip(self, self.bl_records, fp)
 
@@ -144,7 +190,7 @@ class TestSerializations(unittest.TestCase):
         """
         fp = StringIO()
 
-        fp.write(serialization.serialize(self.bl_records, image_name='foo.png', template='abbyyxml'))
+        fp.write(serialization.serialize(self.bl_segmentation, template='abbyyxml'))
         doc = etree.fromstring(fp.getvalue().encode('utf-8'))
         with open(resources / 'FineReader10-schema-v1.xml') as schema_fp:
             abbyy_schema = etree.XMLSchema(etree.parse(schema_fp))
@@ -156,7 +202,7 @@ class TestSerializations(unittest.TestCase):
         """
         fp = StringIO()
 
-        fp.write(serialization.serialize(self.bl_records, image_name='foo.png', template='pagexml'))
+        fp.write(serialization.serialize(self.bl_segmentation, template='pagexml'))
         validate_page(self, fp)
         roundtrip(self, self.bl_records, fp)
 
@@ -166,7 +212,7 @@ class TestSerializations(unittest.TestCase):
         """
         fp = StringIO()
 
-        fp.write(serialization.serialize(self.bl_records, image_name='foo.png', template='alto', regions=self.bl_regions))
+        fp.write(serialization.serialize(self.bl_segmentation_regs, template='alto'))
         validate_alto(self, fp)
         roundtrip(self, self.bl_records, fp)
 
@@ -176,7 +222,7 @@ class TestSerializations(unittest.TestCase):
         """
         fp = StringIO()
 
-        fp.write(serialization.serialize(self.bl_records, image_name='foo.png', template='abbyyxml', regions=self.bl_regions))
+        fp.write(serialization.serialize(self.bl_segmentation_regs, template='abbyyxml'))
         doc = etree.fromstring(fp.getvalue().encode('utf-8'))
         with open(resources / 'FineReader10-schema-v1.xml') as schema_fp:
             abbyy_schema = etree.XMLSchema(etree.parse(schema_fp))
@@ -188,7 +234,7 @@ class TestSerializations(unittest.TestCase):
         """
         fp = StringIO()
 
-        fp.write(serialization.serialize(self.bl_records, image_name='foo.png', template='pagexml', regions=self.bl_regions))
+        fp.write(serialization.serialize(self.bl_segmentation_regs, template='pagexml'))
         validate_page(self, fp)
         roundtrip(self, self.bl_records, fp)
 
@@ -198,7 +244,7 @@ class TestSerializations(unittest.TestCase):
         """
         fp = StringIO()
 
-        fp.write(serialization.serialize([], image_name='foo.png', template='alto', regions=self.bl_regions))
+        fp.write(serialization.serialize(self.bl_seg_nolines_regs, template='alto'))
         validate_alto(self, fp)
 
     def test_region_only_abbyyxml_serialization_validation(self):
@@ -207,7 +253,7 @@ class TestSerializations(unittest.TestCase):
         """
         fp = StringIO()
 
-        fp.write(serialization.serialize([], image_name='foo.png', template='abbyyxml', regions=self.bl_regions))
+        fp.write(serialization.serialize(self.bl_seg_nolines_regs, template='abbyyxml'))
         doc = etree.fromstring(fp.getvalue().encode('utf-8'))
         with open(resources / 'FineReader10-schema-v1.xml') as schema_fp:
             abbyy_schema = etree.XMLSchema(etree.parse(schema_fp))
@@ -219,23 +265,39 @@ class TestSerializations(unittest.TestCase):
         """
         fp = StringIO()
 
-        fp.write(serialization.serialize([], image_name='foo.png', template='pagexml', regions=self.bl_regions))
+        fp.write(serialization.serialize(self.bl_seg_nolines_regs, template='pagexml'))
         validate_page(self, fp)
 
-    def test_serialize_segmentation_alto(self):
+    def test_bl_region_alto_serialization_validation_steps(self):
         """
-        Validates output of `serialize_segmentation` against ALTO schema
+        Validates output with processing steps against ALTO schema
         """
         fp = StringIO()
 
-        fp.write(serialization.serialize_segmentation({'boxes': []}, image_name='foo.png', template='alto'))
+        fp.write(serialization.serialize(self.bl_segmentation, template='alto', processing_steps=self.metadata_steps))
+
         validate_alto(self, fp)
+        roundtrip(self, self.bl_records, fp)
 
-    def test_serialize_segmentation_pagexml(self):
+    def test_bl_region_abbyyxml_serialization_validation_steps(self):
         """
-        Validates output of `serialize_segmentation` against ALTO schema
+        Validates output with processing steps against abbyyXML schema
         """
         fp = StringIO()
 
-        fp.write(serialization.serialize_segmentation({'boxes': []}, image_name='foo.png', template='pagexml'))
+        fp.write(serialization.serialize(self.bl_segmentation, template='abbyyxml', processing_steps=self.metadata_steps))
+
+        doc = etree.fromstring(fp.getvalue().encode('utf-8'))
+        with open(resources / 'FineReader10-schema-v1.xml') as schema_fp:
+            abbyy_schema = etree.XMLSchema(etree.parse(schema_fp))
+            abbyy_schema.assertValid(doc)
+
+    def test_bl_region_pagexml_serialization_validation_steps(self):
+        """
+        Validates output with processing steps against PageXML schema
+        """
+        fp = StringIO()
+        fp.write(serialization.serialize(self.bl_segmentation, template='pagexml', processing_steps=self.metadata_steps))
         validate_page(self, fp)
+        roundtrip(self, self.bl_records, fp)
+
