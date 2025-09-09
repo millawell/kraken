@@ -178,19 +178,8 @@ pango.pango_layout_line_get_pixel_extents.argtypes = [ctypes.POINTER(PangoLayout
                                                       ctypes.POINTER(PangoRectangle),
                                                       ctypes.POINTER(PangoRectangle)]
 
-pango.pango_layout_set_width.argtypes = [ctypes.POINTER(PangoLayout), ctypes.c_int]
-pango.pango_layout_set_height.argtypes = [ctypes.POINTER(PangoLayout), ctypes.c_int]
-
-pango.pango_layout_set_ellipsize.argtypes = [ctypes.POINTER(PangoLayout), ctypes.c_int]
-
-
 pango.pango_units_to_double.argtypes = [ctypes.c_int]
 pango.pango_units_to_double.restype = ctypes.c_double
-
-
-pango.pango_units_from_double.argtypes = [ctypes.c_double]
-pango.pango_units_from_double.restype = ctypes.c_int
-
 
 class LineGenerator(object):
     """
@@ -282,7 +271,7 @@ def _draw_line_on_surface(surface, font, language, text):
 
     return max(ink_rect.width, logical_rect.width), max(ink_rect.height, logical_rect.height)
 
-class ParagraphGenerator(object):
+class PageGenerator(object):
     """
     Produces degraded page images and alto using a single collection of font families.
     """
@@ -330,20 +319,13 @@ class ParagraphGenerator(object):
         logger.debug('Setting font description on layout')
         pango.pango_layout_set_font_description(layout, self.font)
 
-        page_width_pango = pango.pango_units_from_double(self.page_width)
-        page_height_pango = pango.pango_units_from_double(self.page_height)
-        pango.pango_layout_set_width(layout, page_width_pango)
-        pango.pango_layout_set_height(layout, page_height_pango)
-        PANGO_ELLIPSIZE_END = 3
-        pango.pango_layout_set_ellipsize(layout, PANGO_ELLIPSIZE_END)
-
         logger.debug('Filling background of surface')
         cairo.cairo_set_source_rgb(cr, 1.0, 1.0, 1.0)
         cairo.cairo_paint(cr)
 
         return layout
 
-    def _get_region(self, im, layout, text):
+    def _get_regions(self, im, layout, text):
         iterator = pangocairo.pango_layout_get_iter(layout)
         
         ink_rect = PangoRectangle()
@@ -385,14 +367,7 @@ class ParagraphGenerator(object):
             baseline_x1 = float(max(ink_rect.width, logical_rect.width))
 
             baseline = (
-                (
-                    max(1,baseline_x0), 
-                    min(max(1,baseline_y), self.page_height-1)
-                ), 
-                (
-                    min(baseline_x1, self.page_width-1), 
-                    min(max(1,baseline_y), self.page_height-1)
-                )
+                (baseline_x0, baseline_y), (baseline_x1, baseline_y)
             )
 
             new_line = {
@@ -405,12 +380,12 @@ class ParagraphGenerator(object):
 
             line = pangocairo.pango_layout_iter_next_line(iterator)
                     
-        region = {
+        regions = [{
             "bbox": region_bbox,
             "lines": lines
-        }
+        }]
 
-        return region
+        return regions
 
     def _draw_text(self, cr, layout, text):
         logger.debug('Typsetting text')
@@ -448,9 +423,9 @@ class ParagraphGenerator(object):
 
         im = self._get_image_from_surface(surface)
         
-        region = self._get_region(im, layout, text)
+        regions = self._get_regions(im, layout, text)
         
-        return (im, region)
+        return (im, regions)
     
 
 def ocropy_degrade(im, distort=1.0, dsigma=20.0, eps=0.03, delta=0.3, degradations=((0.5, 0.0, 0.5, 0.0),)):
